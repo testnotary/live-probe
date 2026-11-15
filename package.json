@@ -1,0 +1,8 @@
+{
+  "name": "live-probe",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "is-number": "6.0.0"
+  }
+}

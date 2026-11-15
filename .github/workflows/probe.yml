@@ -1,0 +1,102 @@
+name: probe
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  checks: write
+
+jobs:
+  oidc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Commit facts
+        env:
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.event.after }}
+          EVENT_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          main_tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          {
+            echo "event=$GITHUB_EVENT_NAME action=$(jq -r '.action // ""' "$GITHUB_EVENT_PATH") actor=$ACTOR"
+            echo "GITHUB_SHA=$GITHUB_SHA"
+            echo "GITHUB_REF=$GITHUB_REF"
+            echo "checked_out=$(git rev-parse HEAD) tree=$(git rev-parse 'HEAD^{tree}')"
+            echo "checked_out_parents=$(git log -1 --format=%P HEAD)"
+            echo "event_head=$EVENT_HEAD tree=$(git rev-parse "$EVENT_HEAD^{tree}" 2>/dev/null || echo n/a)"
+            echo "event_base=$EVENT_BASE"
+            echo "main_tip_at_run=$main_tip"
+          } | tee -a facts.txt
+          { echo '### Commit facts'; echo '```'; cat facts.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: OIDC claims
+        run: |
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "oidc=unavailable: ACTIONS_ID_TOKEN_REQUEST_URL is not set" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          resp=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=testnotary-probe")
+          token=$(jq -r '.value // empty' <<<"$resp")
+          if [ -z "$token" ]; then
+            echo "oidc=request failed: $(jq -c 'del(.value)' <<<"$resp" 2>/dev/null || echo unparseable)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          payload=$(cut -d. -f2 <<<"$token" | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="$payload="; done
+          claims=$(base64 -d <<<"$payload")
+          jq -S . <<<"$claims"
+          {
+            echo '### OIDC claims (payload only)'
+            echo '```json'; jq -S . <<<"$claims"; echo '```'
+            echo "lifetime_seconds=$(jq '.exp - .iat' <<<"$claims") nbf_before_iat=$(jq '.iat - .nbf' <<<"$claims")"
+            echo "sha_claim_equals_GITHUB_SHA=$([ "$(jq -r .sha <<<"$claims")" = "$GITHUB_SHA" ] && echo yes || echo no)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      attested: ${{ steps.g.outputs.attested }}
+    steps:
+      - id: g
+        run: echo "attested=true" >> "$GITHUB_OUTPUT"
+
+  mskip:
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.attested != 'true' }}
+    strategy:
+      matrix:
+        node: [20, 22]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "node ${{ matrix.node }}"
+
+  mrun:
+    strategy:
+      matrix:
+        node: [20, 22]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "node ${{ matrix.node }}"
+
+  api-check:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" \
+            -f name=api-made-check -f head_sha="$SHA" -f status=completed -f conclusion=success \
+            -f 'output[title]=Created with GITHUB_TOKEN' -f 'output[summary]=T-787 test 5' \
+            -q '{id, app_slug: .app.slug, app_id: .app.id, head_sha, html_url}' | tee -a "$GITHUB_STEP_SUMMARY"

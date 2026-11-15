@@ -1,0 +1,153 @@
+name: sigcheck
+
+# T-803: can the signature check make its GitHub calls with GITHUB_TOKEN
+# under the setup guide's permissions block, inside the 10-second budget?
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      poll_seconds:
+        description: Poll the signing-keys endpoint this long (cache test)
+        default: "0"
+      poll_login:
+        description: Login whose signing keys to poll
+        default: Daniel88dev
+
+# The setup guide's block. Every permission not named is none.
+permissions:
+  contents: read
+  id-token: write
+  checks: write
+
+env:
+  # Account ids: Daniel88dev (org owner), octocat (no access), an id that does not exist.
+  PROBE_IDS: "64728456,583231,99999999999"
+  PROBE_JS: |
+    const api = process.env.GITHUB_API_URL, repo = process.env.GITHUB_REPOSITORY;
+    const keep = ['cache-control','etag','x-ratelimit-limit','x-ratelimit-remaining','x-ratelimit-resource','x-accepted-github-permissions','x-github-request-id'];
+    async function call(path) {
+      const s = performance.now(); let res, body, err;
+      try {
+        res = await fetch(api + path, { headers: {
+          authorization: `Bearer ${process.env.GH_TOKEN}`, accept: 'application/vnd.github+json',
+          'x-github-api-version': '2022-11-28', 'user-agent': 'testnotary-probe' },
+          signal: AbortSignal.timeout(10000) });
+        body = await res.json().catch(() => null);
+      } catch (e) { err = String(e); }
+      const ms = Math.round(performance.now() - s);
+      const headers = res ? Object.fromEntries(keep.map(k => [k, res.headers.get(k)]).filter(([, v]) => v)) : {};
+      return { path, status: res?.status ?? null, ms, err, headers, body };
+    }
+    const brief = r => {
+      const b = r.body; let gist;
+      if (Array.isArray(b)) gist = `${b.length} keys` + (b.length ? ` [${b.map(k => k.id).join(',')}]` : '');
+      else if (b && b.permission) gist = `permission=${b.permission} role_name=${b.role_name}`;
+      else if (b && b.login) gist = `login=${b.login}`;
+      else if (b && b.message) gist = `message=${JSON.stringify(b.message)}`;
+      return { path: r.path, status: r.status, ms: r.ms, gist, err: r.err, headers: r.headers };
+    };
+    async function sequence(id, parallel) {
+      const s = performance.now();
+      const u = await call(`/user/${id}`);
+      const login = u.body?.login ?? 'octocat-does-not-exist-zz';
+      const keysP = () => call(`/users/${login}/ssh_signing_keys`);
+      const permP = () => call(`/repos/${repo}/collaborators/${login}/permission`);
+      let k, p;
+      if (parallel) [k, p] = await Promise.all([keysP(), permP()]);
+      else { k = await keysP(); p = await permP(); }
+      return { id, mode: parallel ? 'parallel' : 'serial', total_ms: Math.round(performance.now() - s), calls: [u, k, p].map(brief) };
+    }
+    const out = [];
+    for (const id of process.env.PROBE_IDS.split(',')) {
+      out.push(await sequence(id, false));   // first: includes connection setup for the first id
+      out.push(await sequence(id, false));
+      out.push(await sequence(id, true));
+    }
+    console.log(JSON.stringify(out, null, 2));
+    const fs = await import('node:fs');
+    const lines = ['### API calls (' + process.env.PROBE_JOB + ')', '', '| id | mode | total ms | user/{id} | ssh_signing_keys | collaborator permission |', '|---|---|---|---|---|---|'];
+    for (const o of out) lines.push(`| ${o.id} | ${o.mode} | ${o.total_ms} | ` + o.calls.map(c => `${c.status} ${c.ms}ms ${c.gist ?? c.err ?? ''}`).join(' | ') + ' |');
+    lines.push('', '<details><summary>headers</summary>', '', '```json', JSON.stringify(out.slice(0, 3).flatMap(o => o.calls.map(c => ({ path: c.path, ...c.headers }))), null, 1), '```', '</details>', '');
+    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+    fs.writeFileSync('probe-' + process.env.PROBE_JOB + '.json', JSON.stringify(out));
+  GIT_SH: |
+    {
+      echo "event=$GITHUB_EVENT_NAME GITHUB_SHA=$GITHUB_SHA"
+      echo "HEAD=$(git rev-parse HEAD) tree=$(git rev-parse 'HEAD^{tree}')"
+      echo "parents=$(git log -1 --format=%P HEAD)"
+      echo "shallow=$(git rev-parse --is-shallow-repository) commits_present=$(git rev-list --count --all)"
+      echo "--- git show HEAD^1:testnotary.json"
+      git show HEAD^1:testnotary.json; echo "exit=$?"
+      echo "--- git diff --name-only HEAD^1 HEAD"
+      git diff --name-only HEAD^1 HEAD; echo "exit=$?"
+      echo "--- git diff --name-only HEAD^2 HEAD (PR head vs merge, for contrast)"
+      git diff --name-only HEAD^2 HEAD 2>&1; echo "exit=$?"
+    } 2>&1 | tee git.txt
+    { echo '### Git on the checkout'; echo '```'; cat git.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+jobs:
+  guide:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.poll_seconds == '0' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [1, 2, 3]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Git facts
+        shell: bash {0}
+        run: eval "$GIT_SH"
+      - name: API calls
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROBE_JOB: guide-${{ matrix.leg }}
+        run: node --input-type=module -e "$PROBE_JS"
+
+  # The ticket's variant: every permission but id-token and checks set to none.
+  minimal:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.poll_seconds == '0' }}
+    permissions:
+      id-token: write
+      checks: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with contents none
+        id: co
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Git facts
+        if: ${{ steps.co.outcome == 'success' }}
+        shell: bash {0}
+        run: eval "$GIT_SH"
+      - name: API calls
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROBE_JOB: minimal
+        run: node --input-type=module -e "$PROBE_JS"
+
+  # Cache test: poll the signing-keys endpoint every 2 seconds, with GITHUB_TOKEN and without auth.
+  poll:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.poll_seconds != '0' }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SECS: ${{ inputs.poll_seconds }}
+          LOGIN: ${{ inputs.poll_login }}
+        run: |
+          end=$(( $(date +%s) + SECS ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            a=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+                 "$GITHUB_API_URL/users/$LOGIN/ssh_signing_keys" | jq -c '[.[].id]')
+            n=$(curl -s -H 'Accept: application/vnd.github+json' \
+                 "$GITHUB_API_URL/users/$LOGIN/ssh_signing_keys" | jq -c 'if type=="array" then [.[].id] else .message end')
+            echo "$(date -u +%H:%M:%S) token=$a anon=$n" | tee -a poll.txt
+            sleep 2
+          done
+          { echo '### Signing-key poll'; echo '```'; cat poll.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
